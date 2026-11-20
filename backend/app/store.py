@@ -11,6 +11,16 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.seed import SEED_ROWS
+from app.snapshot_identity import (
+    ConcurrentRestoreError,
+    IdentityMismatchError,
+    SchemaMismatchError,
+    field_fingerprint as compute_field_fingerprint,
+    identity_fingerprint,
+    is_prefix_collision,
+    model_id_for,
+    normalize_name,
+)
 
 
 class DataChannel:
@@ -166,17 +176,136 @@ class FailureRecovery:
 
 
 class SnapshotEngine:
-    """版本快照引擎：创建、比较和管理数据快照。"""
+    """版本快照引擎：创建、比较和管理数据快照。
+
+    每个快照在创建时即固化「归属证明」（target_model 名称 + model_id 模型
+    身份 + model_version 版本 + field_fingerprint 字段结构），登记、修复与
+    回滚共用同一份证明；名称相近（如 dws_sales / dws_sales_extra）的两张表
+    不得共享归属。恢复入口凭模型身份与字段结构校验恢复范围，并对同一模型
+    身份加锁，防止并发恢复覆盖另一张同名前缀表的分区。
+    """
 
     def __init__(self) -> None:
         self._snapshots: dict[str, dict[str, Any]] = {}
         self._diff_logs: dict[str, dict[str, Any]] = {}
+        # 模型登记表：model_id -> 规范名称/版本/字段/别名
+        self._model_registry: dict[str, dict[str, Any]] = {}
+        # 名称 -> model_id，改名后新旧名称都指向同一身份
+        self._name_index: dict[str, str] = {}
+        # 恢复锁：model_id -> 持锁令牌
+        self._restore_locks: dict[str, str] = {}
+        # 恢复审计记录、归属修复记录、已恢复分区台账
+        self._restore_log: list[dict[str, Any]] = []
+        self._repair_log: list[dict[str, Any]] = []
+        self._restored_partitions: list[dict[str, Any]] = []
 
-    def create_snapshot(self, module: str, entry_id: int, data: dict[str, Any], version_label: str = "") -> str:
-        """创建数据快照，返回快照ID。"""
+    # ------------------------------------------------------------------
+    # 模型身份登记与改名
+    # ------------------------------------------------------------------
+
+    def register_model(self, target_model: str, *, model_version: str = "v1.0",
+                       fields: list[str] | None = None) -> dict[str, Any]:
+        """登记目标模型身份与字段结构，返回规范化身份信息。
+
+        未提供字段结构时保留该版本已固化的指纹，不用空结构覆盖历史登记。
+        """
+        name = normalize_name(target_model)
+        if not name:
+            raise ValueError("目标模型名称不能为空")
+        model_id = self._name_index.get(name) or model_id_for(name)
+        fp = compute_field_fingerprint(fields)
+        record = self._model_registry.setdefault(model_id, {
+            "model_id": model_id,
+            "canonical_name": name,
+            "aliases": [],
+            "versions": {},
+        })
+        existing_fp = record["versions"].get(model_version)
+        if not fields and existing_fp:
+            fp = existing_fp
+        record["versions"][model_version] = fp
+        record["aliases"] = sorted(set(record.get("aliases", [])) | {name})
+        self._name_index[name] = model_id
+        return {"target_model": name, "model_id": model_id,
+                "model_version": model_version, "field_fingerprint": fp}
+
+    def register_rename(self, old_name: str, new_name: str, *,
+                        model_version: str = "v1.0",
+                        fields: list[str] | None = None) -> dict[str, Any]:
+        """登记真正的改名：新旧名称指向同一 model_id；旧快照仍挂在原名称。"""
+        old, new = normalize_name(old_name), normalize_name(new_name)
+        if not old or not new:
+            raise ValueError("改名前后的名称均不能为空")
+        if old == new:
+            raise ValueError("新旧名称相同，不构成改名")
+        existing_new = self._name_index.get(new)
+        old_id = self._name_index.get(old)
+        if existing_new and old_id and existing_new != old_id:
+            raise ValueError(f"名称 {new} 已属于另一模型身份，禁止改名合并")
+        identity = self.register_model(old, model_version=model_version, fields=fields)
+        record = self._model_registry[identity["model_id"]]
+        record["canonical_name"] = new
+        record["aliases"] = sorted(set(record.get("aliases", [])) | {old, new})
+        self._name_index[new] = identity["model_id"]
+        self._name_index[old] = identity["model_id"]
+        return {**identity, "target_model": new, "previous_name": old,
+                "aliases": list(record["aliases"])}
+
+    def resolve_identity(self, target_model: str, *, model_version: str | None = None,
+                         fields: list[str] | None = None) -> dict[str, Any]:
+        """解析目标名称对应的模型身份；未登记时按名称稳定派生。
+
+        未显式提供字段结构时，回退到登记表中该版本（或最新版本）固化的
+        字段指纹，保证后续创建的快照与登记结构一致。
+        """
+        name = normalize_name(target_model)
+        model_id = self._name_index.get(name) or model_id_for(name)
+        fp = compute_field_fingerprint(fields)
+        record = self._model_registry.get(model_id)
+        if record and model_version is None and record.get("versions"):
+            model_version = sorted(record["versions"])[-1]
+        if not fields and record and record.get("versions"):
+            version_key = model_version if model_version in record["versions"] \
+                else sorted(record["versions"])[-1]
+            fp = record["versions"][version_key]
+        return {"target_model": name, "model_id": model_id,
+                "model_version": model_version or "v1.0", "field_fingerprint": fp}
+
+    # ------------------------------------------------------------------
+    # 快照创建（固化归属证明）
+    # ------------------------------------------------------------------
+
+    def _build_ownership(self, data: dict[str, Any], target_model: str | None,
+                         model_id: str | None, model_version: str | None,
+                         fields: list[str] | None, field_fp: str | None) -> dict[str, Any]:
+        name = normalize_name(target_model or data.get("target_model") or data.get("target_table"))
+        if not name:
+            raise ValueError("快照必须携带目标表名才能固化归属")
+        if fields is None:
+            fields = list(data.get("fields") or [])
+        fp = field_fp or compute_field_fingerprint(fields)
+        resolved_id = model_id or self._name_index.get(name) or model_id_for(name)
+        version = model_version or str(data.get("source_version") or data.get("model_version") or "v1.0")
+        return {
+            "target_model": name,
+            "model_id": resolved_id,
+            "model_version": version,
+            "field_fingerprint": fp,
+            "identity_fingerprint": identity_fingerprint(
+                model_id=resolved_id, model_version=version, field_fp=fp),
+        }
+
+    def create_snapshot(self, module: str, entry_id: int, data: dict[str, Any],
+                        version_label: str = "", *, target_model: str | None = None,
+                        model_id: str | None = None, model_version: str | None = None,
+                        fields: list[str] | None = None,
+                        field_fingerprint: str | None = None) -> str:
+        """创建数据快照并固化归属证明，返回快照ID。"""
         data_str = str(sorted(data.items()))
         content_hash = hashlib.sha256(data_str.encode()).hexdigest()[:16]
         snap_id = f"{module}-{entry_id}-v{version_label}-{uuid.uuid4().hex[:8]}"
+        ownership = self._build_ownership(
+            data, target_model, model_id, model_version, fields, field_fingerprint)
         self._snapshots[snap_id] = {
             "snap_id": snap_id,
             "module": module,
@@ -187,15 +316,24 @@ class SnapshotEngine:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "parent_snap_id": None,
             "retention_policy": "keep_forever",
+            "ownership": ownership,
         }
         return snap_id
 
     def create_version_snapshot(self, module: str, entry_id: int, data: dict[str, Any],
-                                version_label: str, parent_snap_id: str | None = None) -> str:
-        """创建带父子关系的版本快照，用于模型发布版本管理。"""
+                                version_label: str, parent_snap_id: str | None = None, *,
+                                target_model: str | None = None,
+                                model_id: str | None = None,
+                                model_version: str | None = None,
+                                fields: list[str] | None = None,
+                                field_fingerprint: str | None = None) -> str:
+        """创建带父子关系的版本快照，并固化目标模型归属证明。"""
         data_str = str(sorted(data.items()))
         content_hash = hashlib.sha256(data_str.encode()).hexdigest()[:16]
         snap_id = f"{module}-{entry_id}-{version_label}-{uuid.uuid4().hex[:8]}"
+        ownership = self._build_ownership(
+            data, target_model, model_id,
+            model_version or version_label, fields, field_fingerprint)
         self._snapshots[snap_id] = {
             "snap_id": snap_id,
             "module": module,
@@ -206,6 +344,7 @@ class SnapshotEngine:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "parent_snap_id": parent_snap_id,
             "retention_policy": "keep_forever",
+            "ownership": ownership,
         }
         return snap_id
 
@@ -217,6 +356,271 @@ class SnapshotEngine:
             s for s in self._snapshots.values()
             if s["module"] == module and s["entry_id"] == entry_id
         ]
+
+    def list_snapshots_by_target(self, target_model: str, *,
+                                 model_id: str | None = None,
+                                 model_version: str | None = None) -> list[dict[str, Any]]:
+        """按目标表精确（规范化后相等）列出快照；前缀相似的其他表不返回。"""
+        name = normalize_name(target_model)
+        expected_id = model_id or self._name_index.get(name)
+        results = []
+        for snap in self._snapshots.values():
+            owner = snap.get("ownership") or {}
+            if expected_id is not None:
+                if owner.get("model_id") != expected_id:
+                    continue
+            elif normalize_name(owner.get("target_model")) != name:
+                continue
+            if model_version and owner.get("model_version") != model_version:
+                continue
+            results.append(snap)
+        return sorted(results, key=lambda s: s["created_at"])
+
+    # ------------------------------------------------------------------
+    # 归属核对、错误挂接发现与修复
+    # ------------------------------------------------------------------
+
+    def find_misattached(self, target_model: str) -> list[dict[str, Any]]:
+        """按原目标名称找出错误挂接：挂在同一计划条目下、归属却是别的模型。
+
+        名称比较一律精确相等，``dws_sales`` 不会把 ``dws_sales_extra`` 的
+        正确历史误判为错误挂接。
+        """
+        name = normalize_name(target_model)
+        expected_id = self._name_index.get(name)
+        grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for snap in self._snapshots.values():
+            grouped.setdefault((snap["module"], snap["entry_id"]), []).append(snap)
+
+        findings: list[dict[str, Any]] = []
+        for snaps in grouped.values():
+            names = {normalize_name(s.get("ownership", {}).get("target_model")) for s in snaps}
+            if name not in names:
+                continue
+            registry_record = self._model_registry.get(expected_id or "")
+            known_aliases = set(registry_record.get("aliases", [])) if registry_record else set()
+            for snap in snaps:
+                owner = snap.get("ownership", {})
+                actual_name = normalize_name(owner.get("target_model"))
+                if actual_name == name:
+                    continue
+                if expected_id and owner.get("model_id") == expected_id and actual_name in known_aliases:
+                    continue  # 同一身份且为登记过的改名别名，不算错误挂接
+                findings.append({
+                    "snap_id": snap["snap_id"],
+                    "module": snap["module"],
+                    "entry_id": snap["entry_id"],
+                    "expected_target": name,
+                    "actual_target": actual_name,
+                    "actual_model_id": owner.get("model_id"),
+                    "model_version": owner.get("model_version"),
+                    "field_fingerprint": owner.get("field_fingerprint"),
+                    "prefix_collision": is_prefix_collision(name, actual_name),
+                })
+        return findings
+
+    def verify_ownership(self, snap_id: str, *, target_model: str,
+                         model_id: str | None = None,
+                         model_version: str | None = None,
+                         fields: list[str] | None = None,
+                         field_fp: str | None = None) -> dict[str, Any]:
+        """核对快照归属证明；身份或字段结构不符即拒绝并返回全部原因。"""
+        snap = self._snapshots.get(snap_id)
+        if snap is None:
+            raise IdentityMismatchError(f"快照 {snap_id} 不存在", reasons=["snapshot_not_found"])
+        owner = snap.get("ownership") or {}
+        name = normalize_name(target_model)
+        expected_id = model_id or self._name_index.get(name)
+        reasons: list[str] = []
+        if normalize_name(owner.get("target_model")) != name and (
+                expected_id is None or owner.get("model_id") != expected_id):
+            reasons.append(
+                f"目标名称不符：快照归属 {owner.get('target_model')}，请求目标 {name}")
+        if expected_id and owner.get("model_id") != expected_id:
+            reasons.append(
+                f"模型身份不符：快照 model_id={owner.get('model_id')}，请求 model_id={expected_id}")
+        if model_version and owner.get("model_version") != model_version:
+            reasons.append(
+                f"模型版本不符：快照 {owner.get('model_version')}，请求 {model_version}")
+        expected_fingerprint = field_fp or compute_field_fingerprint(fields)
+        if fields is not None and owner.get("field_fingerprint") != expected_fingerprint:
+            reasons.append(
+                f"字段结构不符：快照 {owner.get('field_fingerprint')}，请求 {expected_fingerprint}")
+        if reasons:
+            if any("字段结构" in r for r in reasons):
+                raise SchemaMismatchError("；".join(reasons), reasons=reasons)
+            raise IdentityMismatchError("；".join(reasons), reasons=reasons)
+        return {"snap_id": snap_id, "verified": True, "ownership": dict(owner),
+                "identity_fingerprint": owner.get("identity_fingerprint")}
+
+    def repair_attachment(self, snap_id: str, *, expected_target: str,
+                          model_id: str | None = None,
+                          model_version: str | None = None,
+                          fields: list[str] | None = None,
+                          reason: str = "manual_repair") -> dict[str, Any]:
+        """修复错误挂接：仅重写指定快照的归属，不动其他表的正确历史。
+
+        修复前必须确认快照真实身份与预期目标一致，否则拒绝，避免把
+        ``dws_sales`` 的错误快照改写后覆盖 ``dws_sales_extra`` 的历史。
+        """
+        snap = self._snapshots.get(snap_id)
+        if snap is None:
+            raise IdentityMismatchError(f"快照 {snap_id} 不存在", reasons=["snapshot_not_found"])
+        owner = dict(snap.get("ownership") or {})
+        expected_name = normalize_name(expected_target)
+        expected_id = model_id or self._name_index.get(expected_name)
+        if expected_id is None:
+            raise IdentityMismatchError(
+                f"目标 {expected_name} 未登记模型身份，无法证明修复后的归属",
+                reasons=["target_model_unregistered"])
+        if owner.get("model_id") != expected_id:
+            raise IdentityMismatchError(
+                f"拒绝修复：快照真实身份 {owner.get('model_id')} 不属于 {expected_name}({expected_id})",
+                reasons=["ownership_proof_mismatch"])
+        if model_version and owner.get("model_version") != model_version:
+            raise IdentityMismatchError(
+                f"拒绝修复：版本 {owner.get('model_version')} 与请求 {model_version} 不一致",
+                reasons=["model_version_mismatch"])
+        new_fp = compute_field_fingerprint(fields)
+        if fields is not None and owner.get("field_fingerprint") != new_fp:
+            raise IdentityMismatchError(
+                "拒绝修复：字段结构与快照固化结构不一致", reasons=["field_fingerprint_mismatch"])
+
+        before = dict(owner)
+        owner["target_model"] = expected_name
+        owner["model_id"] = expected_id
+        record = self._model_registry.get(expected_id, {})
+        aliases = set(record.get("aliases", [])) | {expected_name, before.get("target_model", "")}
+        record["aliases"] = sorted(a for a in aliases if a)
+        snap["ownership"] = owner
+        snap.setdefault("repair_history", []).append({
+            "from_target": before.get("target_model"),
+            "to_target": expected_name,
+            "model_id": expected_id,
+            "reason": reason,
+            "repaired_at": datetime.now(timezone.utc).isoformat(),
+        })
+        repair_record = {
+            "snap_id": snap_id,
+            "module": snap["module"],
+            "entry_id": snap["entry_id"],
+            "before": before,
+            "after": dict(owner),
+            "reason": reason,
+            "repaired_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._repair_log.append(repair_record)
+        return repair_record
+
+    def repair_history(self) -> list[dict[str, Any]]:
+        return list(self._repair_log)
+
+    # ------------------------------------------------------------------
+    # 并发恢复锁与带归属校验的分区恢复
+    # ------------------------------------------------------------------
+
+    def acquire_restore_lock(self, model_id: str, token: str | None = None) -> str:
+        """对同一模型身份加恢复锁；已被其他任务持锁时拒绝并发恢复。"""
+        holder = self._restore_locks.get(model_id)
+        if holder is not None and holder != token:
+            raise ConcurrentRestoreError(
+                f"模型 {model_id} 已有恢复任务 {holder} 持锁",
+                reasons=["restore_lock_held"])
+        token = token or f"restore-{uuid.uuid4().hex[:10]}"
+        self._restore_locks[model_id] = token
+        return token
+
+    def release_restore_lock(self, model_id: str, token: str) -> bool:
+        if self._restore_locks.get(model_id) == token:
+            self._restore_locks.pop(model_id, None)
+            return True
+        return False
+
+    def restore_target_snapshot(self, *, target_model: str, snap_id: str,
+                                partitions: list[str] | None = None,
+                                model_id: str | None = None,
+                                model_version: str | None = None,
+                                fields: list[str] | None = None,
+                                lock_token: str | None = None) -> dict[str, Any]:
+        """回滚入口：凭归属证明校验恢复范围后才允许恢复分区。
+
+        - 身份/版本/字段结构任一不符：拒绝且不写任何分区；
+        - 同一 model_id 已有恢复任务持锁：拒绝并发恢复；
+        - 恢复记录固化快照归属证明，可审计真实归属。
+        """
+        proof = self.verify_ownership(
+            snap_id, target_model=target_model, model_id=model_id,
+            model_version=model_version, fields=fields)
+        owner = proof["ownership"]
+        token = self.acquire_restore_lock(owner["model_id"], lock_token)
+        snap = self._snapshots[snap_id]
+        requested = [str(p).strip() for p in (partitions or []) if str(p).strip()]
+        available = snap.get("data", {}).get("partitions") or []
+        if requested:
+            invalid = [p for p in requested if p not in available]
+            if invalid:
+                if lock_token is None:
+                    self.release_restore_lock(owner["model_id"], token)
+                raise IdentityMismatchError(
+                    f"分区 {invalid} 不在快照 {snap_id} 的恢复范围内",
+                    reasons=["partition_out_of_scope"])
+            scoped_partitions = requested
+        else:
+            scoped_partitions = list(available)
+        record = {
+            "restore_id": f"restore-{uuid.uuid4().hex[:10]}",
+            "snap_id": snap_id,
+            "target_model": normalize_name(target_model),
+            "model_id": owner["model_id"],
+            "model_version": owner["model_version"],
+            "field_fingerprint": owner["field_fingerprint"],
+            "identity_fingerprint": owner["identity_fingerprint"],
+            "partitions": scoped_partitions,
+            "lock_token": token,
+            "restored_at": datetime.now(timezone.utc).isoformat(),
+            "status": "restored",
+        }
+        self._restore_log.append(record)
+        for part in scoped_partitions:
+            self._restored_partitions.append({
+                "partition": part,
+                "target_model": record["target_model"],
+                "model_id": owner["model_id"],
+                "snap_id": snap_id,
+                "restore_id": record["restore_id"],
+            })
+        if lock_token is None:
+            self.release_restore_lock(owner["model_id"], token)
+        return record
+
+    def available_partitions(self, target_model: str, *, model_id: str | None = None,
+                             model_version: str | None = None) -> list[dict[str, Any]]:
+        """回滚入口查询：列出通过归属证明、当前可用于该目标的分区。"""
+        result = []
+        for snap in self.list_snapshots_by_target(
+                target_model, model_id=model_id, model_version=model_version):
+            for part in snap.get("data", {}).get("partitions", []):
+                result.append({
+                    "partition": part,
+                    "snap_id": snap["snap_id"],
+                    "target_model": snap["ownership"]["target_model"],
+                    "model_id": snap["ownership"]["model_id"],
+                    "model_version": snap["ownership"]["model_version"],
+                    "identity_fingerprint": snap["ownership"]["identity_fingerprint"],
+                })
+        return result
+
+    def restore_history(self, target_model: str | None = None) -> list[dict[str, Any]]:
+        name = normalize_name(target_model)
+        if not name:
+            return list(self._restore_log)
+        return [r for r in self._restore_log if r["target_model"] == name]
+
+    def restored_partitions(self, target_model: str | None = None) -> list[dict[str, Any]]:
+        name = normalize_name(target_model)
+        if not name:
+            return list(self._restored_partitions)
+        return [r for r in self._restored_partitions if r["target_model"] == name]
 
     def diff_snapshots(self, snap_id_a: str, snap_id_b: str) -> dict[str, Any] | None:
         snap_a = self._snapshots.get(snap_id_a)
@@ -245,11 +649,20 @@ class SnapshotEngine:
         self._diff_logs[diff_id] = result
         return result
 
-    def rollback_to_snapshot(self, module: str, entry_id: int, snap_id: str, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """将数据回滚到指定快照版本。"""
+    def rollback_to_snapshot(self, module: str, entry_id: int, snap_id: str,
+                             rows: list[dict[str, Any]], *,
+                             expected_target: str | None = None) -> dict[str, Any] | None:
+        """将数据回滚到指定快照版本。
+
+        快照带归属证明且给出 expected_target 时，先核对归属；名称相近但
+        身份不同的快照直接拒绝，避免覆盖另一张同名前缀表的数据。
+        """
         snap = self._snapshots.get(snap_id)
         if not snap:
             return None
+        owner = snap.get("ownership")
+        if owner and expected_target:
+            self.verify_ownership(snap_id, target_model=expected_target)
         for row in rows:
             if row.get("id") == entry_id:
                 for k, v in snap["data"].items():
@@ -263,7 +676,14 @@ class SnapshotEngine:
         by_module: dict[str, int] = {}
         for s in self._snapshots.values():
             by_module[s["module"]] = by_module.get(s["module"], 0) + 1
-        return {"total_snapshots": len(self._snapshots), "by_module": by_module, "total_diffs": len(self._diff_logs)}
+        return {
+            "total_snapshots": len(self._snapshots),
+            "by_module": by_module,
+            "total_diffs": len(self._diff_logs),
+            "registered_models": len(self._model_registry),
+            "restore_records": len(self._restore_log),
+            "repair_records": len(self._repair_log),
+        }
 
 
 class ArtifactRegistry:
